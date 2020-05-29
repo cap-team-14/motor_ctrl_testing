@@ -1,53 +1,59 @@
+/* #region  Includes */
 #include <Arduino.h>
 #include <EEPROM.h>
 #include <PID_v1.h>
-#include <PID_AutoTune_v0.h>
 #include "Timer.h"
 #include <mcp_can_stm.h>
+/* #endregion */
 
-
+/* #region  General Defs */
+unsigned long int c_time = millis();            // global current time tracker
 #define pin_esc PA9                 // ESC PWM pin
+bool motor_run = 1;                 // global safety override
+/* #endregion */
 
-// global safety override
-bool motor_run = 1;
-
-// global current time tracker
-unsigned long int c_time = millis();
-
+/* #region  System Parameter Defs */
+#define SERIAL_DEBUG 1              // do we want to see debug outputs on serial?
+#define num_sensors 2               // number of actuator position sensors to poll
+#define ss_offset 2                 // acceptable steady state offset (percent) for PID
+#define controllers 3               // number of banked PID controllers
+/* #endregion */
 
 /* #region  Position Sensor Defs */
-#define num_sensors 2
-uint8_t pot_pins [num_sensors] = {PB0, PB1};
-uint16_t start_pos [num_sensors] = {0, 0};
-uint16_t end_pos  [num_sensors] = {0, 0};
-double pot_1_val = 0;
-double pot_2_val = 0;
-double actuator_pos = 0;
-double actuator_pos_1 = 0;
-double actuator_pos_2 = 0;
+const uint8_t pot_pins [num_sensors] = {PB0, PB1};      // pins that the actuator position sensors are on
+uint16_t start_pos [num_sensors] = {0, 0};              // calibration minimum values
+uint16_t end_pos  [num_sensors] = {0, 0};               // calibration maximum values
+double pot_val [num_sensors];                           // array of sensor readings
+double actuator_pos_int [num_sensors];                  // array of intermediate actuator position values
+double actuator_pos = 0;                                // average actuator position based on number of sensors
+// double pot_1_val = 0;
+// double pot_2_val = 0;
+// double actuator_pos_1 = 0;
+// double actuator_pos_2 = 0;
 /* #endregion */
 
 /* #region  PID */
 // PID vars
-double pid_sp, pid_in, pid_out;
-double Kp = 0.25, Ki = 0, Kd = 0;
+double pid_sp;                                  // target position that PID is trying to reach
+double pid_in;                                  // position value that PID will use
+double pid_out;                                 // pid output in the form of motor power and dir
+double Kp = 0.25, Ki = 0, Kd = 0;               // starting parameters for PID, will be overidden by banked params
 
-int ss_offset = 2;                  // acceptable steady state offset (percent)
+const int banked_limits [controllers-1] = {25, 60};         // upper limit of each region, with 100% assumed to be the topmost limit
+const double banked_vals [controllers][3] = {               // Kp, Ki, and Kd for each region
+    {0.25, 0, 0},
+    {0.25, 0, 0},
+    {0.25, 0, 0}
+};
 
 // MatLab values (clutch):
 // double Kp = 0.409610917794219;
 // double Ki = 0.205094462119216;
 // double Kd = 0.0300209726049592;
 
-// autotune vars
-byte ATuneModeRemember = AUTOMATIC;
-double aTuneStep = 5, aTuneNoise = 2, aTuneStartValue = 0;
-unsigned int aTuneLookBack = 5;
-boolean tuning = false;
 
 // PID objects
 PID pid(&actuator_pos, &pid_out, &pid_sp, Kp, Ki, Kd, DIRECT);
-PID_ATune aTune(&actuator_pos, &pid_out);
 /* #endregion */
 
 /* #region  CAN Bus */
@@ -75,14 +81,14 @@ Timer sched_check_queue(10, &c_time);
 uint16_t td(int);
 void calibrate(bool);
 void pid_setup();
-void change_auto_tune();
-void auto_tune_helper(boolean);
 void serial_send();
 void serial_receive();
 void console_input();
 void implausibility();
 bool can_check();
 void can_process();
+void can_send();
+void banked_params();
 /* #endregion */
 
 /* #region  Command Queue */
@@ -97,7 +103,11 @@ uint8_t next_command = 0;
 uint8_t last_command = -1;
 /* #endregion */
 
-// main body
+
+/* ====================== Main Code Body ====================== */
+
+
+/* #region  Setup Function */
 void setup(){
     pinMode(pin_esc, PWM);
     pwmWrite(pin_esc, td(0));       // command motor to remain stationary
@@ -113,37 +123,45 @@ void setup(){
         eep[i] = EEPROM.read(i);
     }
 
-    // check if EEPROM contains useful data
+    // check if EEPROM contains useful data, if not, initialize to 0
     for(int i=0; i<num_sensors; i++){
         start_pos[i] = eep[i] == 65535 ? 0 : eep[i];
         end_pos[i] = eep[i+2] == 65535 ? 0 : eep[i+2];
     }
 
-    Serial.begin();                         // initialize Serial
-    while (!Serial.available()){}           // DEBUG: wait for serial before proceeding
-    Serial.flush();                         // clear serial buffer after receiving input
-    Serial.println("Initialized");
+    if(SERIAL_DEBUG){
+        Serial.begin();                         // initialize Serial
+        while (!Serial.available()){}           // DEBUG: wait for serial before proceeding
+        Serial.flush();                         // clear serial buffer after receiving input
+        Serial.println("Initialized");
+    }
+    
 
     // initialize CAN Bus
     if(!(CAN_OK == CAN.begin(CAN_1000KBPS, MCP_CS))){\
+        if(SERIAL_DEBUG)
         Serial.println("Can error");
-		// warning = 0;
+        // TODO: handle CAN Bus error
 	}
 
-	CAN.init_Filt(0, 0, recv_id);
+CAN.init_Filt(0, 0, recv_id);               // filter CAN messages to our receive ID
 
-    // update tasks to see which should run
+    // update tasks to start their timers
     sched_read_pos.update();
     sched_serial_report.update();
     sched_check_queue.update();
 
     pid_setup();                            // run PID setup function
 }
+/* #endregion */
 
+
+/* #region  Main Loop */
 void loop(){
+    if(SERIAL_DEBUG)
     console_input();                        // DEBUG: get instructions from Serial
-    can_check();
-    c_time = millis();
+    can_check();                            // check for CAN messages
+    c_time = millis();                      // update current time
 
     // update tasks to see which should run
     sched_read_pos.update();
@@ -153,30 +171,21 @@ void loop(){
     // get position data
     if (sched_read_pos.query()){
         // we read from both inputs and then diregard the second reading if only 1 sensor is present
-        pot_1_val = analogRead(pot_pins[0]);
-        pot_2_val = analogRead(pot_pins[1]);
-        actuator_pos_1 = map(pot_1_val, start_pos[0], end_pos[0], 0, 10000)/100.0;
-        actuator_pos_2 = map(pot_2_val, start_pos[1], end_pos[1], 0, 10000)/100.0;
-        //implausibility();                   // check implausibility
+        for(auto i=0; i<num_sensors; i++){
+            pot_val[i] = analogRead(pot_pins[i]);
+            actuator_pos_int[i] = map(pot_val[i], start_pos[i], end_pos[i], 0, 10000)/100.0;
+        }
+        if(num_sensors > 1) implausibility();                   // check implausibility
+
+        // pot_1_val = analogRead(pot_pins[0]);
+        // pot_2_val = analogRead(pot_pins[1]);
+        // actuator_pos_1 = map(pot_1_val, start_pos[0], end_pos[0], 0, 10000)/100.0;
+        // actuator_pos_2 = map(pot_2_val, start_pos[1], end_pos[1], 0, 10000)/100.0;
     }
 
-    // if using PID AutoTune
-    if (tuning){
-        byte val = (aTune.Runtime());
-        if (val != 0){
-            tuning = false;
-        }
-        if (!tuning){ //we're done, set the tuning parameters
-            Kp = aTune.GetKp();
-            Ki = aTune.GetKi();
-            Kd = aTune.GetKd();
-            pid.SetTunings(Kp, Ki, Kd);
-            auto_tune_helper(false);
-        }
-    } else {
-        // figure out what PID wants motor to do
-        pid.Compute();
-    }
+    // check what the PID loop wants motor to do
+    banked_params();
+    pid.Compute();
 
     // if PID is enabled
     if(pid.GetMode()){
@@ -192,12 +201,12 @@ void loop(){
         // global safety override check
         pid_out = (motor_run) ? pid_out : 0;
 
-        // if all safety checks passed
+        // set motor to appropriate power
         pwmWrite(pin_esc, td(pid_out));
     }
 
     // DEBUG: send data over serial
-    if(sched_serial_report.query()){
+    if(sched_serial_report.query() && SERIAL_DEBUG){
         //serial_send();
     }
 
@@ -217,28 +226,31 @@ void loop(){
         }
     }
 }
+/* #endregion */
 
 
+// check for CAN Comms error and process any waiting CAN messages
 bool can_check(){
-    // check for CAN Comms error and process any waiting CAN messages
 		if(CAN_MSGAVAIL == CAN.checkReceive()){
             Serial.println("CAN Message received");
 			can_process();
 			last_can_update = c_time;
 		} else if((c_time - last_can_update > can_timeout)){
             // TODO: process error case
+            return 1;
 		}
+    return 0;
 }
 
 
+// process can messages
 void can_process(){
     // get message from buffer
     CAN.readMsgBuf(&recv_len, recv_msg);
     // verify that message was meant for us
 	if(CAN.getCanId() == recv_id){
         // byte 1
-        motor_run = recv_msg[0] & 0b10000000;                   // motor enable
-        uint8_t pos = (recv_msg[0] & 0b01111111);               // commanded position
+        uint8_t pos = recv_msg[0];                              // commanded position
 
         // check that commanded position is valid then goto it if it is
         if(pos >= 0 && pos <= 100){
@@ -246,10 +258,13 @@ void can_process(){
         }
 
         // byte 2
-        bool cal = (recv_msg[1] & 0b10000000) >> 7;             // calibrate toggle
-        bool cal_m = (recv_msg[1] & 0b01000000) >> 6;           // calibration mode, select 0% or 100%
-        bool conf_req = (recv_msg[1] & 0b00100000) >> 5;        // configuration has been requested
-        bool conf_exp = (recv_msg[1] & 0b00010000) >> 4;        // expect to receive configuration
+        motor_run = (recv_msg[1] & 0b10000000) >> 7;            // motor enable
+        bool speed = (recv_msg[1] & 0b01000000) >> 6;           // speed selector, 0->slow, 1-> fast
+        bool cal = (recv_msg[1] & 0b00100000) >> 5;             // calibrate toggle
+        bool cal_m = (recv_msg[1] & 0b00010000) >> 4;           // calibration mode, select 0% or 100%
+        bool conf_req = (recv_msg[1] & 0b00001000) >> 3;        // configuration has been requested
+        bool conf_exp = (recv_msg[1] & 0b00000100) >> 2;        // expect to receive configuration
+        uint8_t conf_sel = (recv_msg[1] & 0b00000011);          // which banked controller to work on
 
         // if we are expecting to receive configuration, extract it
         if(conf_exp){
@@ -273,24 +288,115 @@ void can_process(){
             calibrate(cal_m);
         }
 
-        Serial.print("Motor enable: "); Serial.print(motor_run);
-        Serial.print("\tCommanded Percent: "); Serial.println(pos);
+        if(SERIAL_DEBUG){
+            Serial.print("Motor enable: "); Serial.print(motor_run);
+            Serial.print("\tCommanded Percent: "); Serial.println(pos);
+        }
+        
     }
 }
 
 
-// Throttle Implausibility Check function
+// prepare and send the CAN messages
+void can_send(){
+
+    buff[0] = (start_pos[0] & 0x111111110000) >> 4;
+    buff[1] = (start_pos[0] & 0x000000001111) << 4;
+    buff[1] |= (start_pos[1] & 0x111100000000) >> 8;
+    buff[2] = (start_pos[1] & 0x000011111111);
+
+    CAN.sendMsgBuf(transmit_ID, 0, 3, buff);
+}
+
+
+// Sensor Implausibility Check function (if multiple sensors are present)
 void implausibility(){
     // check delta between sensor readings
-    if(abs(actuator_pos_1 - actuator_pos_2) < 10){
-        actuator_pos = (actuator_pos_1 + actuator_pos_2)/2;
+    if(abs(actuator_pos_int[0] - actuator_pos_int[1]) < 10){
+        actuator_pos = (actuator_pos_int[0] + actuator_pos_int[1])/2;
         motor_run = 1;
     } else {
         // if delta is greater than ten, there's an issue
-        Serial.print("Implausibility. TPS1: "); Serial.print(actuator_pos_1); Serial.print(", TPS2: ");
-        Serial.println(actuator_pos_2);
+        Serial.print("Implausibility. TPS1: "); Serial.print(actuator_pos_int[0]); Serial.print(", TPS2: ");
+        Serial.println(actuator_pos_int[1]);
         actuator_pos = 0;
         motor_run = 0;
+    }
+}
+
+
+// convert duty cycle (in percent) to PWM value
+uint16_t td(int percent)
+{
+    percent += 50;                              // shift PID output so that it's in the range 0->100
+    //percent = (percent >= 51 && percent < 55) ? 55 : percent;
+    //percent = (percent <= 49 && percent > 45) ? 45 : percent;
+
+    return 65535 * map(percent, 0, 100, 250, 1750) / 1800;
+}
+
+
+// function to calibrate the position sensor(s)
+void calibrate(bool high_low){
+    pwmWrite(pin_esc, td(0));                           // ensure motor is stopped
+
+    if(!high_low){                                      // calibrate min position
+        start_pos[0] = analogRead(pot_pins[0]);
+        start_pos[1] = analogRead(pot_pins[1]);
+        EEPROM.write(0, start_pos[0]);
+        EEPROM.write(1, start_pos[1]);
+    } else {                                            // calibrate max position
+        end_pos[0] = analogRead(pot_pins[0]);
+        end_pos[1] = analogRead(pot_pins[1]);
+        EEPROM.write(2, end_pos[0]);
+        EEPROM.write(3, end_pos[1]);
+    }
+}
+
+
+// function to report data over serial
+void serial_send(){
+    Serial.print(c_time);
+    Serial.print(",");
+    //Serial.print("setpoint: ");
+    //Serial.print(pid_sp);
+    //Serial.print(",");
+    // Serial.print("\tinput: ");
+    Serial.print(actuator_pos);
+    Serial.print(",");
+    // Serial.print("\toutput: ");
+    Serial.println(pid_out);
+    //     Serial.print("\tKp: ");
+    //     Serial.print(pid.GetKp());
+    //     Serial.print(" ");
+    //     Serial.print("\tKi: ");
+    //     Serial.print(pid.GetKi());
+    //     Serial.print(" ");
+    //     Serial.print("\tKd: ");
+    //     Serial.print(pid.GetKd());
+    //     Serial.println();
+    // }
+}
+
+
+// configure and enable the PID
+void pid_setup(){                   
+    // pid_sp = 50;                 // DEBUG: inital PID setpoint
+    pid.SetOutputLimits(-5, 50);    // PID output limits
+    pid.SetSampleTime(5);           // PID refresh rate
+
+    pid.SetMode(AUTOMATIC);         // AUTOMATIC: enabled; MANUAL: disabled
+}
+
+
+// configure/process banked PID controller parameters
+void banked_params(){
+    for(int i=0; i<controllers-1; i++){
+        if(actuator_pos <= banked_limits[i]){
+            pid.SetTunings(banked_vals[i][0], banked_vals[i][1], banked_vals[i][2]);
+        } else if(actuator_pos <= 100 && i == controllers-1){
+            pid.SetTunings(banked_vals[controllers-1][0], banked_vals[controllers-1][1], banked_vals[controllers-1][2]);
+        }
     }
 }
 
@@ -327,9 +433,6 @@ void console_input(){
             } else {
                 Serial.println("Entered value outside limits");
             }
-        } else if ('t' == c) {
-            pwmWrite(pin_esc, td(0));
-            change_auto_tune();
         } else if('k' == c) {
             pwmWrite(pin_esc, td(0));
             char quit = 0;
@@ -424,150 +527,4 @@ void console_input(){
             Serial.print("Toggling PID status to "); Serial.println(!mode);
         }
     }
-}
-
-
-// configure and enable the PID
-void pid_setup(){
-    // pid_sp = 50;                    // DEBUG: inital PID setpoint
-    pid.SetOutputLimits(-5, 50);    // PID output limits
-    pid.SetSampleTime(5);           // PID refresh rate
-
-    pid.SetMode(AUTOMATIC);         // AUTOMATIC: enabled; MANUAL: disabled
-    
-    // if tuning, change appropriate settings
-    if (tuning){
-        tuning = false;
-        change_auto_tune();
-        tuning = true;
-    }
-}
-
-
-// convert duty cycle (in percent) to PWM value
-uint16_t td(int percent)
-{
-    percent += 50;                              // shift PID output so that it's in the range 0->100
-    //percent = (percent >= 51 && percent < 55) ? 55 : percent;
-    //percent = (percent <= 49 && percent > 45) ? 45 : percent;
-
-    // int temp = 65535*((percent/100.0)*(1750+250))/1800;
-    return 65535 * map(percent, 0, 100, 250, 1750) / 1800;
-}
-
-
-// function to calibrate the position sensor(s)
-void calibrate(bool high_low){
-    pwmWrite(pin_esc, td(0));
-
-    if(!high_low){
-        start_pos[0] = analogRead(pot_pins[0]);
-        start_pos[1] = analogRead(pot_pins[1]);
-        EEPROM.write(0, start_pos[0]);
-        EEPROM.write(1, start_pos[1]);
-    } else {
-        end_pos[0] = analogRead(pot_pins[0]);
-        end_pos[1] = analogRead(pot_pins[1]);
-        EEPROM.write(2, end_pos[0]);
-        EEPROM.write(3, end_pos[1]);
-    }
-
-    // Serial.println("Calibrate");
-    // char quit = 0;
-    // while ('q' != quit){
-    //     Serial.println("Enter \"0\" to set zero point or \"1\" to set fully open point");
-    //     Serial.println("Enter \"q\" to return to normal operation");
-    //     while (!Serial.available()){}
-    //     char c = Serial.read();
-    //     if ('0' == c){
-    //         start_pos[0] = analogRead(pot_pins[0]);
-    //         start_pos[1] = analogRead(pot_pins[1]);
-    //         Serial.print("Zero position read as: ");
-    //         Serial.print(start_pos[0]);
-    //         Serial.print(" ");
-    //         Serial.println(start_pos[1]);
-    //     } else if ('1' == c) {
-    //         end_pos[0] = analogRead(pot_pins[0]);
-    //         end_pos[1] = analogRead(pot_pins[1]);
-    //         Serial.print("Open position read as: ");
-    //         Serial.print(end_pos[0]);
-    //         Serial.print(" ");
-    //         Serial.println(end_pos[1]);
-    //     } else if ('q' == c) {
-    //         quit = 'q';
-
-    //         // store these values in EEPROM
-    //         EEPROM.write(0, start_pos[0]);
-    //         EEPROM.write(1, start_pos[1]);
-    //         EEPROM.write(2, end_pos[0]);
-    //         EEPROM.write(3, end_pos[1]);
-
-    //         Serial.println("Exiting Calibration Mode");
-    //         Serial.print("Start Values: ");
-    //         Serial.print(start_pos[0]);
-    //         Serial.print(" ");
-    //         Serial.println(start_pos[1]);
-    //         Serial.print("End Values: ");
-    //         Serial.print(end_pos[0]);
-    //         Serial.print(" ");
-    //         Serial.println(end_pos[1]);
-    //     }
-    // }
-}
-
-
-// autotune helper function
-void change_auto_tune(){
-    if (!tuning){
-        //Set the output to the desired starting frequency.
-        pid_out = aTuneStartValue;
-        aTune.SetNoiseBand(aTuneNoise);
-        aTune.SetOutputStep(aTuneStep);
-        aTune.SetLookbackSec((int)aTuneLookBack);
-        aTune.SetControlType(1);
-        auto_tune_helper(true);
-        tuning = true;
-    } else { //cancel autotune
-        aTune.Cancel();
-        tuning = false;
-        auto_tune_helper(false);
-    }
-}
-
-
-// autotune helper function
-void auto_tune_helper(boolean start){
-    if (start){
-        ATuneModeRemember = pid.GetMode();
-    } else {
-        pid.SetMode(ATuneModeRemember);
-    }
-}
-
-
-// function to report data over serial
-void serial_send(){
-    Serial.print(c_time);
-    Serial.print(",");
-    //Serial.print("setpoint: ");
-    //Serial.print(pid_sp);
-    //Serial.print(",");
-    // Serial.print("\tinput: ");
-    Serial.print(actuator_pos);
-    Serial.print(",");
-    // Serial.print("\toutput: ");
-    Serial.println(pid_out);
-    if (tuning){
-        Serial.println("\ttuning mode");
-    } //else {
-    //     Serial.print("\tKp: ");
-    //     Serial.print(pid.GetKp());
-    //     Serial.print(" ");
-    //     Serial.print("\tKi: ");
-    //     Serial.print(pid.GetKi());
-    //     Serial.print(" ");
-    //     Serial.print("\tKd: ");
-    //     Serial.print(pid.GetKd());
-    //     Serial.println();
-    // }
 }
